@@ -1,125 +1,96 @@
 # ComfyUI-T-LoRA
 
-Custom ComfyUI nodes for running **T-LoRA-style timestep-masked inference** on attention layers.
+Custom ComfyUI loaders for **timestep-masked T-LoRA inference**.
 
-This repository is focused on **inference-time integration in ComfyUI**.  
-For training and reference implementations, see:
+- Official T-LoRA reference implementation: https://github.com/ControlGenAI/T-LoRA
+- Gold-standard training/inference integration reference (multi-model): https://github.com/bghira/SimpleTuner
+- Extensive portable LyCORIS implementation (including T-LoRA training): https://github.com/KohakuBlueleaf/LyCORIS
 
-- Official T-LoRA repo: https://github.com/ControlGenAI/T-LoRA
+## What This Repo Implements
 
-This node is currently intended on supporting only vanilla T-LoRA adapters trained using the reference code.
+Two inference paths are provided:
 
----
+- `Load T-LoRA (Bypass)` / `Load T-LoRA (Bypass, Model Only)`
+  - For official-style attn-processor checkpoints (`...to_q_lora.down.weight`, etc.)
+  - Supports SDXL-style and Flux.1-dev-style official T-LoRA key layouts
+  - Injected with ComfyUI bypass adapters
+  - Per-step mask applied before UNet forward
 
-## Why This Repo Exists
-
-Official T-LoRA pipeline logic sets a timestep-dependent rank mask before each denoise forward pass.
-
-ComfyUI has different model execution and patch caching semantics, so this repo adapts that behavior to ComfyUI’s patcher/wrapper system.
-
----
-
-## Scope
-
-- Loads T-LoRA attention-processor checkpoints (SDXL-style `to_q/to_k/to_v/to_out` LoRA weights)
-- Injects adapter math in **bypass mode** (forward-time, not static merged weights)
-- Applies per-step rank mask using T-LoRA schedule
-- Exposes debug logs to verify masking behavior
-
----
+- `Load T-LoRA (LyCORIS, Bypass)` / `Load T-LoRA (LyCORIS, Bypass, Model Only)`
+  - For LyCORIS-style T-LoRA checkpoints (`q_layer/p_layer/lambda_layer`)
+  - LyCORIS modules are parsed, then converted into ComfyUI bypass adapters
+  - Per-step mask is set via LyCORIS timestep-mask APIs before each denoise step
 
 ## Install
-
-Symlink (or copy) this repo into ComfyUI custom nodes:
 
 ```bash
 ln -s ~/src/ComfyUI-T-LoRA $COMFYUI_PATH/custom_nodes/ComfyUI-T-LoRA
 ```
 
-Or, download it in directly:
+LyCORIS loader nodes require `lycoris-lora` with T-LoRA support from upstream `main`:
 
 ```bash
-cd $COMFYUI_PATH/custom_nodes
-git clone https://github.com/bghira/ComfyUI-T-LoRA
+pip install -U git+https://github.com/KohakuBlueleaf/LyCORIS.git
 ```
 
 Restart ComfyUI after updates.
 
----
+## Quick Usage
 
-## Required Model Placement
+1. Put base model weights in normal ComfyUI model locations.
+2. Put T-LoRA checkpoint in `models/loras`.
+3. Add one loader node:
+   - Official checkpoint: `Load T-LoRA (Bypass)`
+   - LyCORIS checkpoint: `Load T-LoRA (LyCORIS, Bypass)`
+4. Feed returned `MODEL` (and `CLIP` when using non-model-only node) to your sampler path.
 
-For SDXL UNet + CLIP split loading in ComfyUI:
-
-- Base UNet checkpoint in `models/unet` (ComfyUI `diffusion_models` path)
-- T-LoRA weights in `models/loras`
-- CLIP text encoders in `models/text_encoders`
-
----
-
-## Node Usage
-
-Primary nodes:
-
-- `Load T-LoRA (Bypass)` (`TLoraLoaderBypass`)
-- `Load T-LoRA (Bypass, Model Only)` (`TLoraLoaderBypassModelOnly`)
-
-Typical SDXL graph:
-
-1. `UNETLoader` -> base SDXL UNet
-2. `DualCLIPLoader` (`type=sdxl`) -> CLIP-L + CLIP-G
-3. `TLoraLoaderBypass` -> apply T-LoRA weights + masking
-4. Feed resulting `MODEL`/`CLIP` to sampler path
-
-Recommended initial params:
+Recommended start params:
 
 - `strength_model = 1.0`
-- `max_rank = 0` (auto-infer from checkpoint)
+- `max_rank = 0` (auto-infer)
 - `min_rank = 1`
 - `alpha = 1.0`
-- `max_timestep = 0` (auto)
+- `max_timestep = 0` (auto-infer)
 
----
+## Debugging Mask Behavior
 
-## Debug Mask Verification
-
-Set in `TLoraLoaderBypass`:
+Set:
 
 - `debug = true`
 - `debug_every = 1`
 
-You should see logs like:
-
-- `[ComfyUI-T-LoRA][step] ... active_rank=...`
-- `[ComfyUI-T-LoRA][adapter] ... active=...`
-
-This confirms the mask is being computed and consumed during forward passes.
-
----
-
-## Checkpoint Format Expectations
-
-The loader expects official-style T-LoRA attention processor keys, e.g.:
-
-- `...attn1.processor.to_q_lora.down.weight`
-- `...attn1.processor.to_q_lora.up.weight`
-- `...attn2.processor.to_out_lora.down.weight`
-- `...attn2.processor.to_out_lora.up.weight`
-
-Orthogonal variants are supported when corresponding `q_layer/p_layer/lambda/base_*` tensors exist.
+You should see step logs with computed active rank.  
+For adapter-level logs, the first adapter call per step reports active dimensions.
 
 <details>
-<summary>Technical Note: Mapping Strategy</summary>
+<summary>How Timestep Masking Is Applied</summary>
 
-Keys are parsed into per-target module groups and mapped to ComfyUI UNet parameter paths using ComfyUI’s own LoRA key map utilities.  
-Adapters are then installed via bypass injection hooks so adapter math runs at module forward.
+At each denoise step, the node computes an active rank:
+
+`r = int(((max_timestep - t)/max_timestep)^alpha * (max_rank - min_rank)) + min_rank`
+
+Then a binary mask activates ranks `[0:r)` and suppresses higher ranks for that step.
+
+- Official path: mask is consumed by custom T-LoRA bypass adapters.
+- LyCORIS path: mask is set with LyCORIS `set_timestep_mask(...)` and consumed by converted adapters.
 
 </details>
 
----
+<details>
+<summary>Checkpoint Format Notes</summary>
 
-## License / Attribution
+Official node expects keys like:
 
-This repo builds on ideas and checkpoint formats from the projects linked above.  
-Please follow upstream licenses and citation requirements when distributing derivatives or publishing results.
+- `...attn1.processor.to_q_lora.down.weight`
+- `...attn1.processor.to_q_lora.up.weight`
 
+LyCORIS node expects T-LoRA module keys (detected by `lambda_layer` / `q_layer` / `p_layer` entries).  
+Non-T-LoRA LyCORIS modules in a mixed checkpoint are skipped.
+
+</details>
+
+## Current Limitations
+
+- `strength_clip` is currently ignored for these T-LoRA loaders.
+- This repo is inference-focused; training is out of scope.
+- For broad multi-architecture training workflows, use upstream trainer repos directly (SimpleTuner / LyCORIS).
